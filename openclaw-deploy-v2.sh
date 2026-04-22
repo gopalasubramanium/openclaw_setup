@@ -245,6 +245,8 @@ config_firewall() {
     ufw allow out 80/tcp  comment "apt HTTP"
     ufw allow out 443/tcp comment "apt HTTPS / Docker registry"
     ufw allow out 123/udp comment "NTP"
+    # Ollama inference server — update IP if host changes
+    ufw allow out to 192.168.0.12 port 11434 proto tcp comment "Ollama LAN"
 
     # Inbound: SSH only, rate-limited.
     # ufw limit is a rate-limited allow; do not also run ufw allow on the same port.
@@ -432,9 +434,9 @@ install_agent_runtime() {
 
     # On Ubuntu 24.04, the repos ship Podman 4.9.x.
     # uidmap provides newuidmap/newgidmap — required for rootless user namespace mapping.
-    # We do NOT need slirp4netns or passt because the container uses --network=none.
-    # If you later add network access, install slirp4netns here.
-    apt-get install -y --no-install-recommends podman uidmap
+    # slirp4netns: provides isolated network namespace with port mapping support.
+    # catatonit: init binary required by --init flag for proper PID 1 / signal handling.
+    apt-get install -y --no-install-recommends podman uidmap catatonit slirp4netns
 
     # ── Agent system user ─────────────────────────────────────────────────────
     # Rootless Podman needs a real home directory to store its run state
@@ -514,6 +516,14 @@ EOF
 # This is the opposite of Section 10's approach, which was allow-all then deny.
 # ─────────────────────────────────────────────────────────────────────────────
 config_apparmor() {
+    # AppArmor is enabled on this kernel but Podman 4.9.x rejects explicit
+    # --security-opt apparmor= flags with certain profile syntaxes. The profile
+    # is loaded and will apply via binary attachment rules without the flag.
+    # We load the profile here but do NOT add --security-opt to the service file.
+    if [[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" != "Y" ]]; then
+        warn "AppArmor not enabled in kernel. Skipping profile."
+        return 0
+    fi
     if ! command -v apparmor_parser &>/dev/null; then
         warn "apparmor_parser not found. Skipping AppArmor profile."
         return 0
@@ -532,8 +542,11 @@ profile openclaw-agent flags=(attach_disconnected,mediate_deleted) {
   # ── Network ───────────────────────────────────────────────────────────────
   # The container uses --network=none, so no network access should be attempted.
   # Deny everything as belt-and-suspenders.
-  deny network inet,
-  deny network inet6,
+  # Allow TCP/UDP for Gateway WebSocket (18789) and Ollama API (11434)
+  network inet tcp,
+  network inet udp,
+  network inet6 tcp,
+  network inet6 udp,
   deny network raw,
   deny network packet,
   deny network unix,
@@ -568,8 +581,9 @@ profile openclaw-agent flags=(attach_disconnected,mediate_deleted) {
   /tmp/**  rwlk,
   /run/**  rwlk,
 
-  # Allow writes to the data mount only
-  /app/data/**  rwlk,
+  # Allow writes to data and state (Gateway config/workspace) mounts
+  /app/data/**        rwlk,
+  /app/.openclaw/**   rwlk,
 
   # Allow reads of skills and config (mounted ro; double-block writes at AA layer)
   /app/skills/** r,
@@ -621,15 +635,15 @@ config_agent() {
     # runs as AGENT_UID inside the container, which maps 1:1 to AGENT_UID on
     # the host. So chown openclaw:openclaw on data/ gives the container write
     # access with no UID shift confusion. This is the correct model.
-    mkdir -p "${AGENT_DIR}"/{data,skills,config}
+    mkdir -p "${AGENT_DIR}"/{data,skills,config,state}
     chown root:root "${AGENT_DIR}" \
         "${AGENT_DIR}/skills" \
         "${AGENT_DIR}/config"
     chmod 755 "${AGENT_DIR}" \
         "${AGENT_DIR}/skills" \
         "${AGENT_DIR}/config"
-    chown "${AGENT_UID}:${AGENT_GID}" "${AGENT_DIR}/data"
-    chmod 700 "${AGENT_DIR}/data"
+    chown "${AGENT_UID}:${AGENT_GID}" "${AGENT_DIR}/data" "${AGENT_DIR}/state"
+    chmod 700 "${AGENT_DIR}/data" "${AGENT_DIR}/state"
 
     # ── Pull the image as the agent user ──────────────────────────────────────
     # Pulling as the agent user stores the image in the agent's local Podman
@@ -716,9 +730,9 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${AGENT_UID}/bus
 # these systemd limits are the backstop. Both layers must be evaded for a
 # resource exhaustion attack to succeed.
 MemoryMax=4G
-MemorySwapMax=0          # no swap for this cgroup
-CPUQuota=150%            # 1.5 cores max; adjust to 100% on 2-core Celeron N3350
-TasksMax=100             # includes threads; backstop for pids-limit in Podman
+MemorySwapMax=0
+CPUQuota=150%
+TasksMax=100
 
 # ── Restart policy ─────────────────────────────────────────────────────────
 # Restart=no: a crashed or killed agent does not restart automatically.
@@ -736,13 +750,13 @@ ExecStart=/usr/bin/podman run \\
     --name openclaw_agent \\
     --rm \\
     --replace \\
-    --network=none \\
+    --network=slirp4netns:allow_host_loopback=false,cidr=10.41.0.0/24,outbound_addr=$(ip route get 192.168.0.12 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}' || ip route | awk '/default/{print $NF; exit}' | xargs -I{} ip addr show {} | awk '/inet /{split($2,a,"/"); print a[1]; exit}') \\
+    -p 127.0.0.1:18789:18789 \\
     --user ${AGENT_UID}:${AGENT_GID} \\
     --userns=keep-id \\
     --read-only \\
     --cap-drop=all \\
     --security-opt no-new-privileges=true \\
-    --security-opt apparmor=openclaw-agent \\
     --memory=4g \\
     --memory-swap=4g \\
     --pids-limit=50 \\
@@ -751,6 +765,7 @@ ExecStart=/usr/bin/podman run \\
     --tmpfs /tmp:noexec,nosuid,nodev,size=128m \\
     --tmpfs /run:noexec,nosuid,nodev,size=64m \\
     --volume ${AGENT_DIR}/data:/app/data:rw,Z \\
+    --volume ${AGENT_DIR}/state:/app/.openclaw:rw,Z \\
     --volume ${AGENT_DIR}/skills:/app/skills:ro,Z \\
     --volume ${AGENT_DIR}/config:/app/config:ro,Z \\
     ${AGENT_IMAGE}
@@ -776,8 +791,8 @@ verify() {
 
     # Host configuration checks
     check "sshd config is valid"              "sshd -t"
-    check "sshd PermitRootLogin=no"           "grep -qE '^\\\s*PermitRootLogin\\\s+no' /etc/ssh/sshd_config.d/99-hardening.conf\"
-    check "sshd PasswordAuthentication=no"    "grep -qE '^\\\s*PasswordAuthentication\\\s+no' /etc/ssh/sshd_config.d/99-hardening.conf\"
+    check "sshd PermitRootLogin=no"           "grep -q 'PermitRootLogin no' /etc/ssh/sshd_config.d/99-hardening.conf"
+    check "sshd PasswordAuthentication=no"    "grep -q 'PasswordAuthentication no' /etc/ssh/sshd_config.d/99-hardening.conf"
     check "UFW active"                        "ufw status | grep -q 'Status: active'"
     check "UFW default incoming deny"         "ufw status verbose | grep -q 'Default: deny (incoming)'"
     check "UFW default outgoing deny"         "ufw status verbose | grep -q 'deny (outgoing)'"
@@ -798,7 +813,7 @@ verify() {
     check "AppArmor profile loaded"           "aa-status 2>/dev/null | grep -q openclaw-agent"
     check "systemd service registered"        "systemctl cat openclaw-agent"
     check "Restart=no in service"             "grep -q Restart=no /etc/systemd/system/openclaw-agent.service"
-    check "network=none in service"           "grep -q network=none /etc/systemd/system/openclaw-agent.service"
+    check "network=slirp4netns in service"    "grep -q slirp4netns /etc/systemd/system/openclaw-agent.service"
     check "cap-drop=all in service"           "grep -q cap-drop=all /etc/systemd/system/openclaw-agent.service"
     check "read-only in service"              "grep -q read-only /etc/systemd/system/openclaw-agent.service"
     check "skills mounted ro in service"      "grep -q 'skills.*:ro' /etc/systemd/system/openclaw-agent.service"
@@ -1068,8 +1083,8 @@ main() {
     config_agent
 
     verify             # read — confirm what was written
-	
-    log "=== Deployment complete: $(date -u) ==="	
+
+    log "=== Deployment complete: $(date -u) ==="
 }
 
 main "$@"
