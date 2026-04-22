@@ -148,11 +148,11 @@ Runs 30 post-deploy checks and prints `[PASS]` or `[FAIL]` for each. The agent s
 
 With a rootful Docker daemon, a kernel namespace escape gives the attacker host root. With rootless Podman, the daemon does not exist — the container runs as the `openclaw` user. A kernel escape gives the attacker `openclaw`'s UID (999), which has no sudo, no cron, no write access outside `/opt/openclaw/data` and `/var/lib/openclaw`.
 
-### Why `--network=none`
+### Why `slirp4netns` with restricted egress
 
-The container has no network interface at all — not even loopback. There is no bridge to restrict, no iptables rule to forget, no DNS to leak through. Exfiltration and C2 are architecturally impossible while this flag is set.
+The container uses `--network=slirp4netns:allow_host_loopback=false` which gives it a full isolated network stack for port mapping (Gateway WebSocket on 18789, Ollama API on 11434) while preventing it from reaching the host loopback or making arbitrary outbound connections. UFW restricts host-level egress to the Ollama host only.
 
-If OpenClaw requires outbound API access, a restricted bridge must be created with explicit `DOCKER-USER` iptables rules before enabling network access. Do not use `--network=bridge` without egress controls.
+This replaced the original `--network=none` design because `--network=none` and `-p` port mappings are mutually exclusive in Podman — `--network=none` creates an empty namespace with no interfaces, so the port forwarding layer has nothing to bind to.
 
 ### Why `Restart=no`
 
@@ -785,6 +785,66 @@ Cosmetic. The `remount` command succeeds; the warning is from systemd detecting 
 
 Cosmetic output from `systemd-sysv-install`. The service enables correctly. No action required.
 
+### Gateway takes 90–120 seconds to start on first run
+
+Normal behaviour on the ZimaBoard's Celeron hardware. Node.js JIT compilation of the Gateway bundle takes time on first start. Subsequent starts are faster. Do not attempt to connect the CLI or run onboarding until `curl -s http://127.0.0.1:18789` returns HTTP 200.
+
+### `Error: Cannot find module 'grammy'` when adding Telegram channel
+
+The Telegram extension ships without its `grammy` npm dependency bundled. Fix:
+
+```bash
+cd ~/.npm-global/lib/node_modules/openclaw
+npm install grammy
+# Verify
+node -e "require('grammy')" && echo "OK"
+# Then retry:
+openclaw channels add --channel telegram --token YOUR_BOT_TOKEN
+```
+
+### `ENOENT: no such file or directory, mkdir '/app/.openclaw'` on first start
+
+The Gateway needs a writable persistent state directory at `/app/.openclaw` inside the container. This was not mounted in the original service file. The deploy script now creates `/opt/openclaw/state/` and mounts it at `/app/.openclaw:rw,Z`. If you see this error on an existing deploy, create and mount the directory manually:
+
+```bash
+sudo systemctl stop openclaw-agent
+sudo mkdir -p /opt/openclaw/state
+sudo chown 999:989 /opt/openclaw/state
+sudo chmod 700 /opt/openclaw/state
+# Add to service file ExecStart:
+#   --volume /opt/openclaw/state:/app/.openclaw:rw,Z
+sudo systemctl daemon-reload
+sudo systemctl start openclaw-agent
+```
+
+### `--network=none` and `-p` port mapping are mutually exclusive in Podman
+
+`--network=none` creates an empty network namespace with no interfaces — the port forwarding layer has nothing to bind to. The deploy script now uses `--network=slirp4netns:allow_host_loopback=false` which provides an isolated network stack that supports port mapping while preventing arbitrary outbound connections.
+
+### `openclaw onboard` QuickStart switches to Manual for remote gateways
+
+QuickStart mode only supports local gateways. When connecting to a remote Gateway (the container), the wizard automatically switches to Manual mode and only configures the gateway connection. Configure the model provider separately after onboarding:
+
+```bash
+# After onboarding completes:
+openclaw models auth login --provider ollama
+# URL: http://192.168.0.12:11434  (your Ollama host)
+openclaw models set ollama/YOUR_MODEL_NAME
+openclaw models status
+```
+
+### `Error: Pass --to <E.164>, --session-id, or --agent` from `openclaw agent`
+
+The CLI requires an explicit agent target. Always specify `--agent main`:
+
+```bash
+openclaw agent --agent main --message "Hello"
+```
+
+### Gateway WebSocket 1006 abnormal closure on `openclaw agent`
+
+The Gateway takes 90–120 seconds to start. If you run `openclaw agent` immediately after `systemctl start`, the CLI connects before the Gateway is ready and gets an abnormal closure. Wait for `curl -s http://127.0.0.1:18789` to return HTTP 200, then retry.
+
 ---
 
 ## Operational Runbooks
@@ -892,7 +952,7 @@ sudo apt-get autoremove --purge
 | Decision | Chosen | Alternative | Reason for choice |
 |----------|--------|-------------|-------------------|
 | Container runtime | Rootless Podman | Rootful Docker | Kernel escape → openclaw UID, not host root |
-| Network | `--network=none` | Restricted bridge | Zero exfiltration surface; no iptables complexity |
+| Network | `slirp4netns` + UFW | `--network=none` | `--network=none` incompatible with `-p` in Podman; slirp4netns provides isolated stack with port mapping |
 | Restart policy | `Restart=no` | `unless-stopped` | Malicious agent cannot self-resume after kill |
 | Backup | restic | Timeshift rsync | Deduplication = lower write amplification; rsync is not crash-consistent on live Docker storage |
 | Deployment unit | systemd service | docker-compose.yml | Native cgroup limits; `Restart=no` enforced at kernel level; no compose file the agent might reach |
@@ -956,9 +1016,9 @@ Before working with the agent, understand the hard boundaries the deployment enf
 | Read config from `/app/config` | ✅ Allowed | Volume mount (ro) |
 | Execute shell commands | ✅ Allowed (inside container only) | — |
 | Write to `/app/skills` or `/app/config` | ❌ Blocked | ro mount + AppArmor |
-| Make any network connection | ❌ Blocked | `--network=none` + AppArmor |
-| Access the internet | ❌ Blocked | `--network=none` |
-| Call external APIs | ❌ Blocked | `--network=none` |
+| Make arbitrary network connections | ⚠ Restricted | `slirp4netns` + UFW — only port 11434 to Ollama host allowed |
+| Access the internet | ❌ Blocked | `slirp4netns allow_host_loopback=false` + UFW deny outgoing |
+| Call Ollama API (192.168.0.12:11434) | ✅ Allowed | UFW rule + slirp4netns outbound_addr |
 | Restart itself after a crash | ❌ Blocked | `Restart=no` in systemd |
 | Use more than 4 GB RAM | ❌ Blocked | Podman + systemd cgroup |
 | Spawn more than 50 processes | ❌ Blocked | Podman + systemd cgroup |
@@ -1267,7 +1327,7 @@ Restore the general mount after the task is complete.
 
 **Clean separation of concerns.** The operator controls what the agent can do (skills), how it operates (config), and what it can read/write (data mounts). The agent controls nothing about its own deployment.
 
-**No credential leakage via network.** With `--network=none`, the agent cannot exfiltrate API keys, data, or findings regardless of what it is prompted to do. This is architecturally enforced, not policy-enforced.
+**Restricted egress network.** The container uses `slirp4netns` with `allow_host_loopback=false` and UFW restricting outbound to port 11434 on the Ollama host only. The agent cannot exfiltrate data to arbitrary destinations. The allowed path (Ollama API) is intentional and scoped.
 
 **Zero-cost rollback.** If a skill or config change causes bad behaviour, `git revert` and `systemctl restart` restore the previous state in seconds.
 
@@ -1522,8 +1582,8 @@ ExecStart=/usr/bin/podman run \
     --name openclaw_agent_test \
     --rm \
     --replace \
-    --network=none \
-    --user 999:999 \
+    --network=slirp4netns:allow_host_loopback=false,cidr=10.41.0.0/24 \
+    --user 999:989 \
     --userns=keep-id \
     --read-only \
     --cap-drop=all \
@@ -2515,6 +2575,7 @@ These variables are set by the systemd service unit for the container. For CLI i
 |------|---------|-------|------------------|
 | `/opt/openclaw/` | Deployment root | root | No |
 | `/opt/openclaw/data/` | Agent runtime I/O | openclaw | Yes |
+| `/opt/openclaw/state/` | Gateway config, workspace, sessions (`/app/.openclaw`) | openclaw | Yes |
 | `/opt/openclaw/skills/` | Skill definitions | root | No (ro mount) |
 | `/opt/openclaw/config/` | Agent configuration | root | No (ro mount) |
 | `/var/lib/openclaw/` | Agent user home, Podman storage | openclaw | Yes |
