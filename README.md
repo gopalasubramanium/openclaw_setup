@@ -15,14 +15,19 @@ The script treats OpenClaw as a semi-hostile workload from first principles. Eve
 5. [Prerequisites](#prerequisites)
 6. [Installation](#installation)
 7. [First Run](#first-run)
-8. [Managing the Agent](#managing-the-agent)
-9. [Backup and Recovery](#backup-and-recovery)
-10. [Verification](#verification)
-11. [Known Issues and Fixes](#known-issues-and-fixes)
-12. [Operational Runbooks](#operational-runbooks)
-13. [Design Decisions and Trade-offs](#design-decisions-and-trade-offs)
-14. [Residual Risk](#residual-risk)
-15. [Using OpenClaw in This Environment](#using-openclaw-in-this-environment)
+8. [First-Use Setup — Making OpenClaw Operational](#first-use-setup--making-openclaw-operational)
+9. [Managing the Agent](#managing-the-agent)
+10. [Backup and Recovery](#backup-and-recovery)
+11. [Verification](#verification)
+12. [Known Issues and Fixes](#known-issues-and-fixes)
+13. [Operational Runbooks](#operational-runbooks)
+14. [Design Decisions and Trade-offs](#design-decisions-and-trade-offs)
+15. [Residual Risk](#residual-risk)
+16. [Using OpenClaw in This Environment](#using-openclaw-in-this-environment)
+17. [Appendix A — OpenClaw CLI Quick Reference](#appendix-a--openclaw-cli-quick-reference)
+18. [Appendix B — Daily Operations Cheatsheet](#appendix-b--daily-operations-cheatsheet)
+19. [Appendix C — Environment Variables](#appendix-c--environment-variables)
+20. [Appendix D — File and Directory Reference](#appendix-d--file-and-directory-reference)
 
 ---
 
@@ -228,32 +233,594 @@ To stop the agent:   systemctl stop openclaw-agent
   (agent will NOT restart automatically — this is intentional)
 ```
 
-**Do not start the agent until all verification checks pass.**
-
-### Before Starting the Agent
-
-1. Back up the restic key offline:
-   ```bash
-   sudo cat /etc/openclaw/restic.key
-   # Print this or store it in a password manager.
-   # Without it, your backups are unreadable.
-   ```
-
-2. Populate skills and config:
-   ```bash
-   # Skills and config are mounted read-only in the container.
-   # Populate them as root before starting the agent.
-   sudo cp your-skills/* /opt/openclaw/skills/
-   sudo cp your-config/* /opt/openclaw/config/
-   ```
-
-3. Start the agent:
-   ```bash
-   sudo systemctl start openclaw-agent
-   sudo journalctl -u openclaw-agent -f
-   ```
+**Do not start the agent until all verification checks pass. Then continue to the next section before starting anything.**
 
 ---
+
+## First-Use Setup — Making OpenClaw Operational
+
+> **Read this before running `systemctl start openclaw-agent`.**
+
+The deploy script builds the security cage. It does **not** install OpenClaw itself. The two layers are deliberately separate:
+
+```
+openclaw-deploy-v2.sh   →  host hardening, Podman runtime,
+                            systemd service, firewall, backups
+                            (the cage)
+
+You do this section     →  Node.js CLI, onboarding, API key,
+                            channel config, exec approvals
+                            (OpenClaw inside the cage)
+```
+
+The container image pulled by the deploy script is the OpenClaw Gateway process. Before it is useful, the **OpenClaw CLI** must be installed and onboarding must run — this is what configures your API key, workspace, and channels. The CLI talks to the Gateway over WebSocket on port 18789.
+
+---
+
+### Step 1 — Install Node.js on the ZimaBoard
+
+The deploy script does not install Node.js. It is required for the OpenClaw CLI.
+
+```bash
+# Install Node.js 24 via NodeSource — not Ubuntu's repo (too old)
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# Verify — must be v24.x
+node --version
+npm --version
+```
+
+---
+
+### Step 2 — Install the OpenClaw CLI
+
+Install as your normal user, not root. The CLI is the operator control plane — it does not need to run as root.
+
+```bash
+npm install -g openclaw@latest
+
+# Verify
+openclaw --version
+```
+
+If `openclaw` is not found after install, the npm global bin directory is not in PATH:
+
+```bash
+# Find where npm puts global bins
+npm config get prefix
+
+# Add it to PATH permanently
+echo 'export PATH="$(npm config get prefix)/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+openclaw --version
+```
+
+---
+
+### Step 3 — Start the Gateway container
+
+```bash
+sudo systemctl start openclaw-agent
+
+# Confirm it is running
+sudo systemctl status openclaw-agent
+
+# Watch until you see the Gateway listening on port 18789
+sudo journalctl -u openclaw-agent -f
+# Look for a line like: Gateway listening on ws://127.0.0.1:18789
+# Ctrl-C to stop following once confirmed
+```
+
+---
+
+### Step 4 — Run onboarding
+
+Onboarding is the one-time wizard that configures your model provider API key, workspace, and first channel. Run it pointing at the Gateway that is now running in the container.
+
+```bash
+# Connect to the local Gateway running in the container
+openclaw onboard --mode remote --remote-url ws://127.0.0.1:18789
+```
+
+If running from your **laptop instead of the ZimaBoard**:
+
+```bash
+# Replace with your ZimaBoard's actual IP address
+openclaw onboard --mode remote --remote-url ws://192.168.1.100:18789
+```
+
+The wizard will walk you through:
+
+1. **Security warning** — read it, then confirm to continue
+2. **Model provider** — choose Anthropic (Claude), OpenAI, Ollama (local), or another provider
+3. **API key** — paste your key for the chosen provider
+4. **Channel** — optionally add Telegram (fastest: just a bot token), Slack, Discord, or others. You can skip this and add channels later
+5. **Skills** — skip for now; add after confirming basic operation
+6. **Hooks** — skip for now
+7. **Apply and restart** — select Restart to apply all config
+
+At the end of onboarding, note the **gateway token** shown on screen. You will need it to connect the dashboard from a browser.
+
+---
+
+### Step 5 — Verify the Gateway is live
+
+```bash
+# Overall health
+openclaw doctor
+
+# Gateway status
+openclaw gateway status
+
+# Model provider auth status
+openclaw models status
+
+# Everything in one view
+openclaw status
+```
+
+All checks should be green. If `models status` shows an auth error, re-run:
+
+```bash
+openclaw models auth add
+```
+
+---
+
+### Step 6 — Send a first message
+
+```bash
+# Quickest test — CLI direct
+openclaw agent --message "Hello, are you online?"
+
+# With extended thinking
+openclaw agent --message "What can you do?" --thinking medium
+```
+
+If you set up Telegram during onboarding, open your bot in the Telegram app and send it a message directly — you do not need the CLI for day-to-day use once a channel is configured.
+
+---
+
+### Step 7 — Open the dashboard (optional)
+
+```bash
+# On the ZimaBoard itself (requires a browser)
+openclaw dashboard
+# Opens http://127.0.0.1:18789
+
+# Or from your laptop's browser — navigate to:
+# http://192.168.1.100:18789
+# Paste the gateway token when prompted
+```
+
+---
+
+### Step 8 — Configure exec approvals
+
+By default the agent cannot run any shell commands. Define exactly what it is allowed to execute. Start with the minimum needed for your intended tasks.
+
+```bash
+# View current approvals (empty on first run)
+openclaw approvals get
+
+# Add safe read-only commands appropriate for document processing tasks
+openclaw approvals allowlist add "/usr/bin/ls"
+openclaw approvals allowlist add "/usr/bin/cat"
+openclaw approvals allowlist add "/usr/bin/find"
+openclaw approvals allowlist add "/usr/bin/grep"
+openclaw approvals allowlist add "/usr/bin/wc"
+openclaw approvals allowlist add "/usr/bin/python3"
+
+# Set security mode to allowlist-only (never use 'full' — allows everything)
+openclaw approvals set --file <(echo '{"security":"allowlist"}')
+
+# Verify
+openclaw approvals get
+```
+
+---
+
+### Step 9 — Back up the restic key
+
+```bash
+sudo cat /etc/openclaw/restic.key
+```
+
+Print this value or store it in a password manager **before doing anything else**. If this key is lost, the restic backup repository is permanently unreadable. There is no recovery path.
+
+---
+
+### Step 10 — Populate skills and config (if you have them)
+
+Skills and config are mounted read-only in the container. They must be placed as root before or between restarts — the agent cannot write to them.
+
+```bash
+# Place skill files
+sudo cp your-skill.json /opt/openclaw/skills/
+sudo chmod 644 /opt/openclaw/skills/your-skill.json
+
+# Place config
+sudo cp your-config.yaml /opt/openclaw/config/config.yaml
+sudo chmod 644 /opt/openclaw/config/config.yaml
+
+# Restart to pick up the new files
+sudo systemctl restart openclaw-agent
+```
+
+---
+
+### The network constraint — critical for API access
+
+The container runs with `--network=none`. The Gateway inside the container **cannot reach your model provider's API** in the default configuration. This means the agent will accept messages but cannot call Claude/GPT/etc to generate responses unless one of these two approaches is used.
+
+**Option A — Enable scoped outbound HTTPS (recommended for cloud API use):**
+
+Follow the [Temporarily Enabling Outbound Network Access](#temporarily-enabling-outbound-network-access) procedure in the Using OpenClaw section, using your API provider's IP. To make it permanent rather than temporary, skip the restore step and leave the restricted bridge in place.
+
+Find your provider's IP:
+
+```bash
+# Anthropic
+dig +short api.anthropic.com
+
+# OpenAI
+dig +short api.openai.com
+```
+
+**Option B — Use a local model via Ollama (fully air-gapped, no API cost):**
+
+```bash
+# Install Ollama on the ZimaBoard host (outside the container)
+curl -fsSL https://ollama.ai/install.sh | sh
+
+# Pull a model (runs on the host, not in the container)
+ollama pull llama3.2       # 2 GB — fast, capable
+# or
+ollama pull mistral        # 4 GB — more capable
+
+# Ollama listens on localhost:11434
+# Podman maps the host loopback to a reachable address inside the container
+# so --network=none containers can reach host services via host-gateway
+
+# During onboarding, choose 'ollama' as your provider
+# The Gateway will call http://host-gateway:11434 automatically
+```
+
+Option B is the only fully air-gapped path. Option A requires a deliberate, scoped relaxation of network isolation for the specific API endpoint IP.
+
+---
+
+### First-use completion checklist
+
+```
+□  All 30 deploy script verification checks PASS
+□  node --version shows v24.x
+□  openclaw --version works
+□  sudo systemctl start openclaw-agent
+□  journalctl confirms Gateway listening on 18789
+□  openclaw onboard --mode remote --remote-url ws://127.0.0.1:18789
+     □  model provider chosen
+     □  API key entered and accepted
+     □  optional: Telegram/Slack channel added
+□  openclaw doctor — all green
+□  openclaw models status — provider authenticated
+□  openclaw agent --message "Hello" — receives a reply
+□  openclaw approvals allowlist add [commands your tasks need]
+□  sudo cat /etc/openclaw/restic.key — KEY BACKED UP OFFLINE
+□  Network decision made: cloud API bridge OR local Ollama
+```
+
+---
+
+## First-Use Setup — Making OpenClaw Operational
+
+> **What the deploy script does vs what it does not do.**
+>
+> `openclaw-deploy-v2.sh` builds the **secure cage**: host hardening, rootless Podman
+> runtime, systemd service unit, firewall, and backups. It pulls the OpenClaw container
+> image but it does **not** install the OpenClaw CLI, configure your API key, or connect
+> any channels. Those steps are yours to do after the script finishes.
+>
+> The relationship is:
+> ```
+> openclaw-deploy-v2.sh   →  builds the cage (Podman, systemd, UFW, restic)
+> you install the CLI     →  installs the operator control plane (Node.js + openclaw)
+> openclaw onboard        →  configures API key, workspace, channels inside the cage
+> ```
+> Everything below happens **after** all 30 verification checks pass.
+
+---
+
+### Step 1 — Decide on network access first
+
+This is the most important decision before doing anything else. The container runs with
+`--network=none` by default, which means the Gateway inside it **cannot reach any external
+API** — including Anthropic, OpenAI, or any other cloud model provider. Choose one of two
+paths before onboarding makes sense.
+
+**Path A — Local model via Ollama (fully air-gapped, `--network=none` stays intact)**
+
+The Gateway calls Ollama on the host over the host loopback address. Podman maps this into
+the container even with `--network=none` because it exposes `host-gateway` as an internal
+alias for the host. No firewall changes are needed.
+
+```bash
+# Install Ollama on the ZimaBoard host (outside the container)
+curl -fsSL https://ollama.ai/install.sh | sh
+sudo systemctl enable --now ollama
+
+# Pull a model — llama3.2 fits comfortably in 8 GB RAM
+ollama pull llama3.2
+
+# Verify Ollama is reachable
+curl http://127.0.0.1:11434/api/tags
+```
+
+When onboarding asks for a provider, choose `ollama`. The Gateway will use
+`http://host-gateway:11434` to reach it.
+
+**Path B — External API provider (Claude, GPT, etc.) — requires controlled network relaxation**
+
+You must enable outbound HTTPS from the container to your provider's endpoint. For a
+permanent setup:
+
+```bash
+sudo systemctl stop openclaw-agent
+
+# Resolve the provider IP first — use your actual provider
+# Anthropic example:
+PROVIDER_IP=$(dig +short api.anthropic.com | grep -v CNAME | head -1)
+echo "Provider IP: ${PROVIDER_IP}"
+
+# Create a restricted bridge
+sudo podman network create \
+  --driver bridge \
+  --subnet 172.30.0.0/29 \
+  openclaw-restricted
+
+# Allow only HTTPS to the provider and DNS — block everything else
+sudo iptables -I FORWARD -s 172.30.0.0/29 -d "${PROVIDER_IP}" -p tcp --dport 443 -j ACCEPT
+sudo iptables -I FORWARD -s 172.30.0.0/29 -p udp --dport 53 -j ACCEPT
+sudo iptables -A FORWARD -s 172.30.0.0/29 -j DROP
+
+# Persist the rules across reboot
+sudo apt-get install -y iptables-persistent
+sudo iptables-save | sudo tee /etc/iptables/rules.v4
+
+# Switch the service to use the restricted network
+sudo sed -i 's/--network=none/--network=openclaw-restricted/' \
+    /etc/systemd/system/openclaw-agent.service
+sudo systemctl daemon-reload
+
+# Confirm the change — network=none should no longer appear
+grep 'network=' /etc/systemd/system/openclaw-agent.service
+```
+
+> Note: once you make this change, the security posture check in
+> [Full Security Posture Verification](#full-security-posture-verification-after-any-temporary-change)
+> will show `network=none` as absent. This is expected and correct — update your runbook
+> to reflect that `network=openclaw-restricted` is the new intended state.
+
+---
+
+### Step 2 — Install Node.js 24 on the ZimaBoard
+
+The OpenClaw CLI requires Node.js 24. Ubuntu 24.04's default `nodejs` package is too old.
+
+```bash
+# Add the NodeSource repository for Node.js 24
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# Verify — must show v24.x
+node --version
+npm --version
+```
+
+---
+
+### Step 3 — Install the OpenClaw CLI
+
+Install as your normal operator user — **not root**.
+
+```bash
+npm install -g openclaw@latest
+
+# Verify
+openclaw --version
+```
+
+If `openclaw` is not found after install, the npm global bin directory is missing from PATH:
+
+```bash
+# Find the npm global prefix
+npm config get prefix
+# Example output: /home/gopalasubramanium/.npm-global
+
+# Add its bin/ to PATH permanently
+echo 'export PATH="$(npm config get prefix)/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+openclaw --version
+```
+
+---
+
+### Step 4 — Start the container
+
+```bash
+sudo systemctl start openclaw-agent
+
+# Watch the logs until the Gateway confirms it is listening on port 18789
+sudo journalctl -u openclaw-agent -f
+# Look for: Gateway listening on ws://...18789
+# Press Ctrl-C once you see it
+```
+
+---
+
+### Step 5 — Run onboarding
+
+The one-time interactive wizard that configures your API key, workspace, and first channel.
+Run as your operator user (not root), pointing at the Gateway inside the container.
+
+```bash
+openclaw onboard --mode remote --remote-url ws://127.0.0.1:18789
+```
+
+**What the wizard asks:**
+
+1. **Security warning** — read it fully, then confirm to continue
+2. **Model provider** — choose based on your Step 1 decision:
+   - Path A (Ollama): choose `ollama`
+   - Path B (external API): choose `anthropic`, `openai`, or your provider
+3. **API key** — paste when prompted. Stored in `~/.openclaw/openclaw.json` on the
+   host, not inside the container.
+4. **Channel setup** — Telegram is the fastest option (requires a bot token from
+   [@BotFather](https://t.me/BotFather) on Telegram). You can skip all channels
+   and add them later with `openclaw channels add`.
+5. **Skills** — skip for now; add after the first successful chat
+6. **Hooks** — skip for now
+7. **Confirm and restart** — let the wizard apply config and restart the Gateway
+
+If onboarding fails to connect to the Gateway:
+
+```bash
+# Confirm the container is running
+sudo systemctl is-active openclaw-agent
+
+# If inactive, start it
+sudo systemctl start openclaw-agent
+
+# Then retry onboarding
+openclaw onboard --mode remote --remote-url ws://127.0.0.1:18789
+```
+
+---
+
+### Step 6 — Verify the full stack
+
+```bash
+# Gateway health
+openclaw gateway status
+
+# Comprehensive health check — all items should be green
+openclaw doctor
+
+# Confirm the model provider is authenticated and responding
+openclaw models status
+
+# Summary view of all subsystems
+openclaw status
+```
+
+---
+
+### Step 7 — Send your first message
+
+```bash
+# Quick CLI test
+openclaw agent --message "Hello, are you online?"
+
+# If Telegram was configured during onboarding:
+# Open Telegram on your phone, find your bot, send any message
+# It should reply within a few seconds
+
+# Open the web dashboard
+openclaw dashboard
+# This attempts to open http://127.0.0.1:18789 in a browser on the ZimaBoard.
+# From your laptop, navigate to http://ZIMABOARD_IP:18789 in any browser.
+# Paste the Gateway token shown at the end of onboarding when prompted.
+```
+
+---
+
+### Step 8 — Configure exec approvals
+
+The agent cannot execute shell commands until you explicitly allowlist them.
+Start conservatively and only add what your actual tasks require.
+
+```bash
+# See current state (empty on first run)
+openclaw approvals get
+
+# Add safe read-only commands for document and file processing
+openclaw approvals allowlist add "/usr/bin/ls"
+openclaw approvals allowlist add "/usr/bin/cat"
+openclaw approvals allowlist add "/usr/bin/find"
+openclaw approvals allowlist add "/usr/bin/grep"
+openclaw approvals allowlist add "/usr/bin/wc"
+openclaw approvals allowlist add "/usr/bin/sort"
+openclaw approvals allowlist add "/usr/bin/head"
+openclaw approvals allowlist add "/usr/bin/tail"
+openclaw approvals allowlist add "/usr/bin/python3"
+
+# Set security mode: allowlist-only — anything not listed is denied
+# NEVER set mode to "full" on a production host
+openclaw approvals set --file <(echo '{"security":"allowlist"}')
+
+# Confirm the config was accepted
+openclaw approvals get
+```
+
+---
+
+### Step 9 — Back up the restic encryption key
+
+Do this before any other operational work. If this key is lost, your backup repository
+is permanently unreadable — there is no recovery path.
+
+```bash
+sudo cat /etc/openclaw/restic.key
+# Copy the output and store it in a password manager, or print it and keep it offline.
+```
+
+---
+
+### Complete first-use checklist
+
+Work through this in order. Do not proceed to step N+1 until step N is confirmed.
+
+```
+□  STEP 1 — Network decision
+     □  Path A: Ollama installed  →  systemctl is-active ollama  →  model pulled
+     □  Path B: restricted bridge created, iptables rules saved,
+                service file updated to --network=openclaw-restricted
+
+□  STEP 2 — Node.js 24
+     □  node --version shows v24.x
+
+□  STEP 3 — OpenClaw CLI
+     □  openclaw --version returns a version string
+
+□  STEP 4 — Container started
+     □  sudo systemctl start openclaw-agent
+     □  journalctl confirms Gateway listening on 18789
+
+□  STEP 5 — Onboarding complete
+     □  openclaw onboard --mode remote --remote-url ws://127.0.0.1:18789
+     □  Provider chosen and API key accepted
+     □  Optional: Telegram bot token added and channel connected
+
+□  STEP 6 — Stack verified
+     □  openclaw doctor  →  all green
+     □  openclaw models status  →  provider authenticated
+
+□  STEP 7 — First message received
+     □  openclaw agent --message "Hello"  →  got a reply
+
+□  STEP 8 — Exec approvals configured
+     □  Allowlist populated with needed commands
+     □  Security mode set to "allowlist"
+
+□  STEP 9 — Restic key backed up offline
+     □  Key stored in password manager or printed and kept offline
+```
+
+---
+
 
 ## Managing the Agent
 
