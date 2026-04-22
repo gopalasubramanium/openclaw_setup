@@ -22,6 +22,7 @@ The script treats OpenClaw as a semi-hostile workload from first principles. Eve
 12. [Operational Runbooks](#operational-runbooks)
 13. [Design Decisions and Trade-offs](#design-decisions-and-trade-offs)
 14. [Residual Risk](#residual-risk)
+15. [Using OpenClaw in This Environment](#using-openclaw-in-this-environment)
 
 ---
 
@@ -655,3 +656,869 @@ podman image inspect ghcr.io/openclaw/openclaw:latest \
 **Physical access.** The ZimaBoard has no Secure Boot, no TPM attestation, and no disk encryption configured by this script. Physical access to the board is full access to all data.
 
 **Single SSD.** There is no RAID, no redundant storage, no automated failover. SSD failure = service outage until manual recovery. Monitor SMART data and replace proactively.
+
+---
+
+## Using OpenClaw in This Environment
+
+This section covers practical use of OpenClaw inside this hardened deployment — from first interaction to advanced operational patterns, including how to temporarily adjust the security posture for specific tasks and how to restore it afterwards.
+
+---
+
+### What OpenClaw Can and Cannot Do Here
+
+Before working with the agent, understand the hard boundaries the deployment enforces. These are not soft defaults — they are enforced at multiple independent layers (Podman, systemd cgroup, AppArmor) and cannot be circumvented from inside the container.
+
+| Capability | Status | Enforced by |
+|------------|--------|-------------|
+| Read files from `/app/data` | ✅ Allowed | Volume mount |
+| Write files to `/app/data` | ✅ Allowed | Volume mount, AppArmor |
+| Read skills from `/app/skills` | ✅ Allowed | Volume mount (ro) |
+| Read config from `/app/config` | ✅ Allowed | Volume mount (ro) |
+| Execute shell commands | ✅ Allowed (inside container only) | — |
+| Write to `/app/skills` or `/app/config` | ❌ Blocked | ro mount + AppArmor |
+| Make any network connection | ❌ Blocked | `--network=none` + AppArmor |
+| Access the internet | ❌ Blocked | `--network=none` |
+| Call external APIs | ❌ Blocked | `--network=none` |
+| Restart itself after a crash | ❌ Blocked | `Restart=no` in systemd |
+| Use more than 4 GB RAM | ❌ Blocked | Podman + systemd cgroup |
+| Spawn more than 50 processes | ❌ Blocked | Podman + systemd cgroup |
+| Use more than 1.5 CPU cores | ❌ Blocked | Podman + systemd cgroup |
+| Modify its own container image | ❌ Blocked | `--read-only` |
+| Access host filesystem | ❌ Blocked | Namespace isolation + AppArmor |
+| Access Docker/Podman socket | ❌ Blocked | AppArmor hard-deny |
+
+Understanding this table before designing tasks for the agent will save significant debugging time. Tasks that assume outbound connectivity, large memory, or writable config will silently fail or produce confusing errors inside the container.
+
+---
+
+### Basic Usage
+
+#### Giving the Agent Input
+
+OpenClaw reads its operating context from the mounted directories. The primary input mechanisms are:
+
+**Placing files in `/opt/openclaw/data/`** — this is the agent's writable working directory. Files placed here before starting the agent are immediately readable.
+
+```bash
+# Place a document for the agent to process
+sudo cp ~/my-document.txt /opt/openclaw/data/input.txt
+sudo chown openclaw:openclaw /opt/openclaw/data/input.txt
+
+# Start the agent
+sudo systemctl start openclaw-agent
+
+# Watch it work
+sudo journalctl -u openclaw-agent -f
+```
+
+**Placing skills in `/opt/openclaw/skills/`** — skills define what the agent can do. These must be placed as root before starting; the agent cannot modify them.
+
+```bash
+# Install a new skill
+sudo cp ~/my-skill.json /opt/openclaw/skills/
+sudo chmod 644 /opt/openclaw/skills/my-skill.json
+# Restart required for new skills to be loaded
+sudo systemctl restart openclaw-agent
+```
+
+**Placing config in `/opt/openclaw/config/`** — configuration controls the agent's operating parameters: model settings, system prompts, safety filters.
+
+```bash
+# Update agent configuration
+sudo cp ~/agent-config.yaml /opt/openclaw/config/config.yaml
+sudo chmod 644 /opt/openclaw/config/config.yaml
+sudo systemctl restart openclaw-agent
+```
+
+#### Reading Agent Output
+
+```bash
+# Read files the agent wrote
+ls -la /opt/openclaw/data/
+cat /opt/openclaw/data/output.txt
+
+# Read agent logs
+sudo journalctl -u openclaw-agent -n 200 --no-pager
+
+# Live log stream during a task
+sudo journalctl -u openclaw-agent -f
+
+# All logs since last start
+sudo journalctl -u openclaw-agent -b
+```
+
+#### Starting and Stopping a Task
+
+```bash
+# Start a task run
+sudo systemctl start openclaw-agent
+
+# Stop when task is complete
+sudo systemctl stop openclaw-agent
+
+# Check exit code — 0 = clean exit, non-zero = crash or error
+systemctl show openclaw-agent --property ExecMainStatus
+```
+
+#### Cleaning Up Between Runs
+
+Because the container is `--read-only`, nothing persists inside the container across runs. Only `/opt/openclaw/data/` accumulates state. Clean it selectively:
+
+```bash
+# Remove only output files, keep inputs
+sudo find /opt/openclaw/data -name 'output*' -delete
+
+# Full clean of data directory
+sudo rm -rf /opt/openclaw/data/*
+sudo chown openclaw:openclaw /opt/openclaw/data
+```
+
+---
+
+### Intermediate Usage
+
+#### Running the Agent Against a Batch of Files
+
+```bash
+# Stage a batch of input files
+sudo mkdir -p /opt/openclaw/data/batch-$(date +%Y%m%d)
+sudo cp ~/documents/*.pdf /opt/openclaw/data/batch-$(date +%Y%m%d)/
+sudo chown -R openclaw:openclaw /opt/openclaw/data/batch-$(date +%Y%m%d)
+
+# Write a task manifest the agent will read
+cat << 'EOF' | sudo tee /opt/openclaw/data/task.json
+{
+  "task": "summarise",
+  "input_dir": "/app/data/batch-20260421",
+  "output_dir": "/app/data/results",
+  "format": "markdown"
+}
+EOF
+sudo chown openclaw:openclaw /opt/openclaw/data/task.json
+
+# Run
+sudo systemctl start openclaw-agent
+
+# Wait for completion
+while systemctl is-active --quiet openclaw-agent; do sleep 5; done
+echo "Agent finished. Exit: $(systemctl show openclaw-agent --property ExecMainStatus)"
+
+# Collect results
+ls /opt/openclaw/data/results/
+```
+
+#### Monitoring Resource Usage During a Task
+
+```bash
+# Watch CPU and memory usage of the agent cgroup in real time
+systemd-cgtop /system.slice/openclaw-agent.service
+
+# One-shot resource snapshot
+systemctl show openclaw-agent \
+  --property MemoryCurrent,CPUUsageNSec,TasksCurrent
+
+# Container-level view (run as openclaw user context)
+sudo runuser -u openclaw -- \
+  env XDG_RUNTIME_DIR=/run/user/$(id -u openclaw) \
+  podman stats openclaw_agent --no-stream
+```
+
+#### Inspecting the Agent's Filesystem View
+
+Useful for debugging why a task cannot find a file, or verifying mounts are correct before a run.
+
+```bash
+# List what the agent can see at /app
+sudo runuser -u openclaw -- \
+  env XDG_RUNTIME_DIR=/run/user/$(id -u openclaw) \
+  podman exec openclaw_agent ls -la /app/
+
+# Verify the agent's identity inside the container
+sudo runuser -u openclaw -- \
+  env XDG_RUNTIME_DIR=/run/user/$(id -u openclaw) \
+  podman exec openclaw_agent id
+
+# Verify network is truly absent
+sudo runuser -u openclaw -- \
+  env XDG_RUNTIME_DIR=/run/user/$(id -u openclaw) \
+  podman exec openclaw_agent ip addr
+# Expected: only 'lo' if --network=none is not fully applied,
+# or 'RTNETLINK answers: Operation not permitted' — both are correct
+```
+
+#### Preserving a Task Run for Audit
+
+```bash
+# Before starting: record current state of data dir
+sudo find /opt/openclaw/data -type f | sort > /tmp/pre-run-manifest.txt
+
+# After the run: record what changed
+sudo find /opt/openclaw/data -type f | sort > /tmp/post-run-manifest.txt
+diff /tmp/pre-run-manifest.txt /tmp/post-run-manifest.txt
+
+# Archive the run
+sudo tar -czf /opt/backups/run-$(date +%Y%m%d-%H%M).tar.gz \
+  /opt/openclaw/data \
+  /var/log/openclaw-deploy.log
+sudo journalctl -u openclaw-agent -b --no-pager > \
+  /opt/backups/agent-log-$(date +%Y%m%d-%H%M).txt
+```
+
+---
+
+### Advanced Usage
+
+#### Running Multiple Sequential Tasks Without Full Restart
+
+The container is ephemeral — each `systemctl start` launches a fresh container with the same immutable image. This is a feature, not a limitation: you get a clean execution environment every time without rebuilding anything.
+
+```bash
+# Pattern: stage → start → wait → collect → clean → repeat
+for task in task1.json task2.json task3.json; do
+  echo "--- Running ${task} ---"
+
+  # Stage this task's input
+  sudo cp ~/tasks/"${task}" /opt/openclaw/data/task.json
+  sudo chown openclaw:openclaw /opt/openclaw/data/task.json
+
+  # Run
+  sudo systemctl start openclaw-agent
+
+  # Wait for container to exit (Restart=no means it will not linger)
+  while systemctl is-active --quiet openclaw-agent; do sleep 3; done
+
+  # Collect output
+  sudo cp /opt/openclaw/data/output.json \
+    ~/results/"${task%.json}-output.json" 2>/dev/null || true
+
+  # Log the exit status
+  STATUS=$(systemctl show openclaw-agent --property ExecMainStatus | cut -d= -f2)
+  echo "Exit status: ${STATUS}"
+
+  # Clean up data for next run (preserves skills and config)
+  sudo rm -f /opt/openclaw/data/task.json /opt/openclaw/data/output.json
+done
+```
+
+#### Passing Secrets to the Agent Safely
+
+The agent has no network access and cannot call a secrets manager. The correct pattern is to write secrets into `/opt/openclaw/data/` immediately before a run and remove them immediately after. Never write secrets into `skills/` or `config/` — those are backed up by restic.
+
+```bash
+# Write secret just before the run
+echo "sk-..." | sudo tee /opt/openclaw/data/.api-key > /dev/null
+sudo chmod 600 /opt/openclaw/data/.api-key
+sudo chown openclaw:openclaw /opt/openclaw/data/.api-key
+
+# Start the agent
+sudo systemctl start openclaw-agent
+
+# Wait for completion
+while systemctl is-active --quiet openclaw-agent; do sleep 3; done
+
+# Remove the secret immediately — do not leave it in the data dir
+sudo rm -f /opt/openclaw/data/.api-key
+
+# Verify it is gone
+ls -la /opt/openclaw/data/.api-key 2>&1
+```
+
+**Important:** `/opt/openclaw/data/` is excluded from restic backups by default, so secrets written here are not leaked into the backup repository. If you change the exclude list, re-check this.
+
+#### Versioning Skills and Config with Git
+
+Skills and config are root-owned and read-only in the container. Tracking them with git gives you rollback, audit history, and a clear deployment process.
+
+```bash
+# Initialise git tracking for skills and config
+sudo git -C /opt/openclaw init
+sudo git -C /opt/openclaw add skills/ config/
+sudo git -C /opt/openclaw commit -m "Initial skills and config"
+
+# Deploy a new skill version
+sudo cp ~/new-skill.json /opt/openclaw/skills/
+sudo git -C /opt/openclaw add skills/new-skill.json
+sudo git -C /opt/openclaw commit -m "Add new-skill v1.0"
+sudo systemctl restart openclaw-agent
+
+# Roll back to the previous version if the new skill misbehaves
+sudo systemctl stop openclaw-agent
+sudo git -C /opt/openclaw revert HEAD --no-edit
+sudo systemctl start openclaw-agent
+```
+
+#### Limiting the Agent to Specific Input Files Only
+
+By default the agent can read anything placed in `/opt/openclaw/data/`. For sensitive tasks where you want to restrict what the agent can see, create a subdirectory with restrictive permissions and only mount that.
+
+Modify the service's volume mount to a subdirectory:
+
+```bash
+sudo systemctl stop openclaw-agent
+
+# Edit the service file
+sudo nano /etc/systemd/system/openclaw-agent.service
+# Change:
+#   --volume /opt/openclaw/data:/app/data:rw,Z
+# To:
+#   --volume /opt/openclaw/data/task-20260421:/app/data:rw,Z
+
+sudo systemctl daemon-reload
+
+# Create the restricted task directory
+sudo mkdir -p /opt/openclaw/data/task-20260421
+sudo chown openclaw:openclaw /opt/openclaw/data/task-20260421
+sudo cp ~/specific-files/* /opt/openclaw/data/task-20260421/
+
+sudo systemctl start openclaw-agent
+```
+
+Restore the general mount after the task is complete.
+
+---
+
+### Benefits in This Environment
+
+**Repeatable execution.** The container image is immutable and the container filesystem is read-only. Every run starts from an identical state. Behaviour differences between runs are caused by inputs, not by accumulated container state.
+
+**Bounded blast radius.** Even if the agent produces catastrophic output — filling `/opt/openclaw/data/`, exhausting CPU, generating malicious files — the damage is contained to that directory and that cgroup. The host, other services, and the network are unaffected.
+
+**Forensic clarity.** Because the agent cannot modify its own skills, config, or container layer, any unexpected behaviour can be traced to: the input it received, the skill it executed, or the image it ran. There are no hidden state changes accumulating silently.
+
+**Clean separation of concerns.** The operator controls what the agent can do (skills), how it operates (config), and what it can read/write (data mounts). The agent controls nothing about its own deployment.
+
+**No credential leakage via network.** With `--network=none`, the agent cannot exfiltrate API keys, data, or findings regardless of what it is prompted to do. This is architecturally enforced, not policy-enforced.
+
+**Zero-cost rollback.** If a skill or config change causes bad behaviour, `git revert` and `systemctl restart` restore the previous state in seconds.
+
+---
+
+### Challenges and Limitations
+
+#### No Outbound Network Access by Default
+
+This is the most significant operational constraint. Any OpenClaw capability that requires calling an external API — LLM inference endpoints, web search, tool APIs — is blocked. The agent is effectively air-gapped.
+
+**Mitigation patterns:**
+
+- Pre-fetch data and place it in `/opt/openclaw/data/` before the run
+- Run the agent as a pure local processor (document analysis, code generation, file transformation) that does not require live API calls
+- For tasks requiring API access, see [Temporarily Enabling Network Access](#temporarily-enabling-outbound-network-access)
+
+#### Read-Only Skills and Config
+
+The agent cannot improve or modify its own skills at runtime. This blocks self-improvement loops and any workflow where the agent is expected to write back to its own knowledge base.
+
+**Mitigation:** Implement a human-in-the-loop update process — the agent writes proposed skill updates to `/opt/openclaw/data/proposed-skills/`, an operator reviews and approves them, then copies approved updates to `/opt/openclaw/skills/` as root.
+
+#### No Persistent Container State
+
+Each start launches a clean container. Any files the agent writes to the container's own filesystem (not the mounted volumes) are lost when the container exits. This catches developers who are used to Docker workflows where containers accumulate state.
+
+**Mitigation:** Everything that must persist must be written to `/app/data` (maps to `/opt/openclaw/data/`). Structure the agent's output to always write results to `/app/data/` explicitly.
+
+#### Memory Cap at 4 GB
+
+For large document processing, embedding generation, or local model inference, 4 GB may be insufficient. The cap is enforced at both Podman and systemd cgroup layers.
+
+**Mitigation options:**
+
+```bash
+# Temporarily raise the limit for a specific large task
+# (restore afterwards — see safe procedures below)
+sudo systemctl stop openclaw-agent
+sudo systemctl set-property openclaw-agent MemoryMax=6G
+sudo systemctl start openclaw-agent
+# After the task:
+sudo systemctl stop openclaw-agent
+sudo systemctl set-property openclaw-agent MemoryMax=4G
+```
+
+Note: `systemctl set-property` writes a drop-in override file. The service file itself is unchanged. Remove the override with:
+
+```bash
+sudo rm -rf /etc/systemd/system/openclaw-agent.service.d/
+sudo systemctl daemon-reload
+```
+
+#### CPU Quota at 1.5 Cores
+
+On the 2-core Celeron N3350 variant of the ZimaBoard, 1.5 cores is 75% of total CPU. The host remains responsive but the agent cannot burst. Long-running inference tasks will be noticeably slower than on a higher-core count host.
+
+**On the 4-core J3455:** 1.5 cores is 37.5% of available CPU — conservative and appropriate for a background agent.
+
+#### PID Limit of 50
+
+Some agent workloads spawn many short-lived subprocesses (e.g. running shell commands in parallel). 50 PIDs including threads is tight. If the agent fails with `fork: retry: Resource temporarily unavailable`, this is the cause.
+
+**Temporary increase:**
+
+```bash
+sudo systemctl stop openclaw-agent
+sudo systemctl set-property openclaw-agent TasksMax=200
+# Also update the Podman flag in the service file:
+sudo sed -i 's/--pids-limit=50/--pids-limit=150/' \
+    /etc/systemd/system/openclaw-agent.service
+sudo systemctl daemon-reload
+sudo systemctl start openclaw-agent
+# Restore after task:
+sudo systemctl stop openclaw-agent
+sudo rm -rf /etc/systemd/system/openclaw-agent.service.d/
+sudo sed -i 's/--pids-limit=150/--pids-limit=50/' \
+    /etc/systemd/system/openclaw-agent.service
+sudo systemctl daemon-reload
+```
+
+---
+
+### Temporarily Adjusting the Security Posture
+
+This section covers common scenarios where a security control needs to be relaxed temporarily for a specific task, with exact commands to relax it and exact commands to restore it. Every relaxation should be treated as a maintenance window: stop the agent first, make the change, run the task, restore, verify.
+
+**The fundamental rule:** document every change before making it, restore it before starting the next unrelated task, and verify the restore with the verification suite.
+
+---
+
+#### Temporarily Enabling Outbound Network Access
+
+**When:** The agent needs to call an external API (LLM endpoint, web search, tool API) for a specific task.
+
+**Risk:** The agent gains the ability to exfiltrate data from `/opt/openclaw/data/`, call C2 infrastructure if compromised, and make arbitrary outbound connections. Limit this window to the minimum time needed.
+
+**Procedure:**
+
+```bash
+# 1. Stop the agent
+sudo systemctl stop openclaw-agent
+
+# 2. Create a restricted bridge network for the agent
+#    --internal=false allows external routing
+#    --subnet defines the agent's IP range
+sudo podman network create \
+  --driver bridge \
+  --subnet 172.30.0.0/29 \
+  openclaw-restricted
+
+# 3. Add iptables rules to restrict what the bridge can reach.
+#    Allow ONLY the specific API endpoints the agent needs.
+#    Replace 1.2.3.4 with the actual IP of the API endpoint.
+#    Use 'host api.example.com' or 'dig +short api.example.com' to resolve first.
+API_IP="1.2.3.4"
+sudo iptables -I FORWARD -s 172.30.0.0/29 -d "${API_IP}" -p tcp --dport 443 -j ACCEPT
+sudo iptables -I FORWARD -s 172.30.0.0/29 ! -d "${API_IP}" -j DROP
+sudo iptables -I FORWARD -s 172.30.0.0/29 -p udp --dport 53 -j ACCEPT
+
+# 4. Edit the service to use the restricted network instead of none
+sudo sed -i 's/--network=none/--network=openclaw-restricted/' \
+    /etc/systemd/system/openclaw-agent.service
+sudo systemctl daemon-reload
+
+# 5. Run the task
+sudo systemctl start openclaw-agent
+
+# 6. When done: RESTORE IMMEDIATELY
+sudo systemctl stop openclaw-agent
+
+sudo sed -i 's/--network=openclaw-restricted/--network=none/' \
+    /etc/systemd/system/openclaw-agent.service
+sudo systemctl daemon-reload
+
+# Remove iptables rules
+sudo iptables -D FORWARD -s 172.30.0.0/29 -d "${API_IP}" -p tcp --dport 443 -j ACCEPT
+sudo iptables -D FORWARD -s 172.30.0.0/29 ! -d "${API_IP}" -j DROP
+sudo iptables -D FORWARD -s 172.30.0.0/29 -p udp --dport 53 -j ACCEPT
+
+# Remove the network
+sudo podman network rm openclaw-restricted
+
+# 7. Verify network=none is restored
+grep 'network=' /etc/systemd/system/openclaw-agent.service
+# Expected: --network=none
+```
+
+**After restoring network isolation, check for unexpected data in `/opt/openclaw/data/`:**
+
+```bash
+sudo find /opt/openclaw/data -newer /tmp/pre-network-task-marker -type f
+# Create the marker before the task: sudo touch /tmp/pre-network-task-marker
+```
+
+---
+
+#### Temporarily Allowing the Agent to Write Config
+
+**When:** The agent is being used in a supervised self-improvement workflow where an operator reviews and approves proposed config changes.
+
+**Risk:** The agent can modify its own operating parameters — system prompts, safety filters, model settings — on next restart. Changes persist until manually reverted. This is a high-risk relaxation and should only be done in a session where the operator watches every write.
+
+**Safer alternative:** Instead of making config writable, configure the agent to write proposed changes to `/app/data/proposed-config/` and have the operator review and manually promote them.
+
+```bash
+# ── SAFER PATTERN (recommended) ──────────────────────────────────────────
+# Agent writes proposals to data dir; operator reviews and promotes.
+
+sudo mkdir -p /opt/openclaw/data/proposed-config
+sudo chown openclaw:openclaw /opt/openclaw/data/proposed-config
+
+# Instruct the agent (via its task input) to write proposed config updates
+# to /app/data/proposed-config/ rather than /app/config/
+
+# After the run, review proposals:
+ls /opt/openclaw/data/proposed-config/
+cat /opt/openclaw/data/proposed-config/proposed-config.yaml
+
+# If approved, promote manually as root:
+sudo cp /opt/openclaw/data/proposed-config/proposed-config.yaml \
+    /opt/openclaw/config/config.yaml
+sudo systemctl restart openclaw-agent
+
+# ── DIRECT WRITE (use only if absolutely necessary) ───────────────────────
+# Stop agent
+sudo systemctl stop openclaw-agent
+
+# Temporarily make config writable in the service
+sudo sed -i 's|config:/app/config:ro|config:/app/config:rw|' \
+    /etc/systemd/system/openclaw-agent.service
+sudo systemctl daemon-reload
+
+# Run the supervised session
+sudo systemctl start openclaw-agent
+
+# RESTORE IMMEDIATELY after session
+sudo systemctl stop openclaw-agent
+sudo sed -i 's|config:/app/config:rw|config:/app/config:ro|' \
+    /etc/systemd/system/openclaw-agent.service
+sudo systemctl daemon-reload
+
+# Verify the change was restored
+grep 'config.*:r' /etc/systemd/system/openclaw-agent.service
+# Expected: config:/app/config:ro
+
+# Review exactly what the agent wrote to config
+sudo git -C /opt/openclaw diff config/
+```
+
+---
+
+#### Temporarily Allowing the Agent to Write Skills
+
+**When:** Evaluating a proposed skill from the agent in a sandboxed test run before promoting it to production.
+
+**Recommended pattern:** Never make skills writable in the production service. Instead, create a second test service with a separate skills directory.
+
+```bash
+# Create a test skills directory with the current skills as a baseline
+sudo cp -r /opt/openclaw/skills /opt/openclaw/skills-test
+sudo chown -R openclaw:openclaw /opt/openclaw/skills-test
+
+# Create a test data directory
+sudo mkdir -p /opt/openclaw/data-test
+sudo chown openclaw:openclaw /opt/openclaw/data-test
+
+# Write a test service (do not modify the production service)
+sudo cat > /etc/systemd/system/openclaw-agent-test.service << 'EOF'
+# TEST SERVICE — for skill development only. DO NOT enable in production.
+# Differences from production: skills mount is rw, separate data dir.
+[Unit]
+Description=OpenClaw Agent TEST (skill development)
+After=network-online.target
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+Environment=HOME=/var/lib/openclaw
+Environment=XDG_RUNTIME_DIR=/run/user/999
+MemoryMax=4G
+MemorySwapMax=0
+CPUQuota=150%
+TasksMax=100
+Restart=no
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw-agent-test
+
+ExecStart=/usr/bin/podman run \
+    --name openclaw_agent_test \
+    --rm \
+    --replace \
+    --network=none \
+    --user 999:999 \
+    --userns=keep-id \
+    --read-only \
+    --cap-drop=all \
+    --security-opt no-new-privileges=true \
+    --memory=4g \
+    --memory-swap=4g \
+    --pids-limit=50 \
+    --init \
+    --tmpfs /tmp:noexec,nosuid,nodev,size=128m \
+    --tmpfs /run:noexec,nosuid,nodev,size=64m \
+    --volume /opt/openclaw/data-test:/app/data:rw,Z \
+    --volume /opt/openclaw/skills-test:/app/skills:rw,Z \
+    --volume /opt/openclaw/config:/app/config:ro,Z \
+    ghcr.io/openclaw/openclaw:latest
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+
+# Run the test
+sudo systemctl start openclaw-agent-test
+sudo journalctl -u openclaw-agent-test -f
+
+# Review what the agent wrote to skills-test
+sudo diff -r /opt/openclaw/skills /opt/openclaw/skills-test
+
+# If you approve a proposed skill, promote it to production:
+sudo systemctl stop openclaw-agent
+sudo cp /opt/openclaw/skills-test/new-skill.json /opt/openclaw/skills/
+sudo git -C /opt/openclaw add skills/new-skill.json
+sudo git -C /opt/openclaw commit -m "Promote new-skill from test"
+sudo systemctl start openclaw-agent
+
+# Clean up the test service when done
+sudo systemctl disable --now openclaw-agent-test 2>/dev/null || true
+sudo rm /etc/systemd/system/openclaw-agent-test.service
+sudo systemctl daemon-reload
+```
+
+---
+
+#### Temporarily Raising Memory for a Large Task
+
+**When:** Processing a large document corpus, generating embeddings, or running local inference that exceeds 4 GB.
+
+```bash
+# Before: take a snapshot of current limits
+systemctl show openclaw-agent --property MemoryMax,MemorySwapMax
+
+# Stop the agent
+sudo systemctl stop openclaw-agent
+
+# Raise limit for this task only (writes a drop-in, does not touch the service file)
+# On an 8 GB host, 6 GB leaves 2 GB for the OS — do not go higher.
+sudo systemctl set-property openclaw-agent MemoryMax=6G MemorySwapMax=0
+
+# Verify the drop-in was written
+cat /etc/systemd/system/openclaw-agent.service.d/50-property-MemoryMax.conf
+
+# Run the task
+sudo systemctl start openclaw-agent
+while systemctl is-active --quiet openclaw-agent; do sleep 5; done
+
+# RESTORE: remove the drop-in
+sudo rm -rf /etc/systemd/system/openclaw-agent.service.d/
+sudo systemctl daemon-reload
+
+# Verify restored
+systemctl show openclaw-agent --property MemoryMax
+# Expected: MemoryMax=4294967296 (4 GB in bytes)
+```
+
+---
+
+#### Temporarily Disabling AppArmor for Debugging
+
+**When:** Diagnosing whether AppArmor is blocking a legitimate operation. This should be used only in a debugging session, never in production.
+
+```bash
+# Check if AppArmor is currently blocking something
+sudo journalctl -k | grep -i 'apparmor.*DENIED' | tail -20
+
+# Put the profile into complain mode (logs denials but does not block)
+sudo aa-complain /etc/apparmor.d/openclaw-agent
+sudo systemctl restart openclaw-agent
+
+# After debugging, review what would have been blocked:
+sudo journalctl -k | grep -i 'apparmor.*ALLOW\|apparmor.*audit' | grep openclaw | tail -30
+
+# RESTORE: put the profile back into enforce mode immediately
+sudo aa-enforce /etc/apparmor.d/openclaw-agent
+sudo systemctl restart openclaw-agent
+
+# Verify enforcement is active
+sudo aa-status | grep openclaw-agent
+# Expected: 'openclaw-agent' under 'profiles in enforce mode'
+```
+
+If complain mode reveals a legitimate path the agent needs, add it to the AppArmor profile rather than leaving the profile in complain mode:
+
+```bash
+# Edit the profile to allow the new path
+sudo nano /etc/apparmor.d/openclaw-agent
+# Add the required allow rule
+
+# Reload the profile
+sudo apparmor_parser -r /etc/apparmor.d/openclaw-agent
+
+# Confirm enforce mode
+sudo aa-status | grep openclaw-agent
+```
+
+---
+
+#### Full Security Posture Verification After Any Temporary Change
+
+After any temporary adjustment, run this before starting the next unrelated task:
+
+```bash
+# Verify all critical security controls are in their hardened state
+echo "=== Security posture verification ==="
+
+grep -q 'network=none' /etc/systemd/system/openclaw-agent.service \
+  && echo "[PASS] network=none" \
+  || echo "[FAIL] network not none — RESTORE REQUIRED"
+
+grep -q 'skills.*:ro' /etc/systemd/system/openclaw-agent.service \
+  && echo "[PASS] skills read-only" \
+  || echo "[FAIL] skills writable — RESTORE REQUIRED"
+
+grep -q 'config.*:ro' /etc/systemd/system/openclaw-agent.service \
+  && echo "[PASS] config read-only" \
+  || echo "[FAIL] config writable — RESTORE REQUIRED"
+
+grep -q 'cap-drop=all' /etc/systemd/system/openclaw-agent.service \
+  && echo "[PASS] cap-drop=all" \
+  || echo "[FAIL] capabilities not dropped"
+
+grep -q 'read-only' /etc/systemd/system/openclaw-agent.service \
+  && echo "[PASS] read-only filesystem" \
+  || echo "[FAIL] container filesystem writable"
+
+[[ ! -d /etc/systemd/system/openclaw-agent.service.d ]] \
+  && echo "[PASS] no systemd overrides" \
+  || echo "[WARN] systemd overrides present: $(ls /etc/systemd/system/openclaw-agent.service.d/)"
+
+sudo aa-status 2>/dev/null | grep -q 'openclaw-agent' \
+  && sudo aa-status | grep -A1 'enforce' | grep -q 'openclaw-agent' \
+  && echo "[PASS] AppArmor enforce mode" \
+  || echo "[FAIL] AppArmor not enforcing openclaw-agent"
+
+echo "=== End verification ==="
+```
+
+---
+
+### Practical Scenarios
+
+#### Scenario 1: One-Shot Document Analysis (No Network Required)
+
+Typical use. The agent reads documents, produces a report, exits.
+
+```bash
+sudo cp ~/quarterly-report.pdf /opt/openclaw/data/
+sudo chown openclaw:openclaw /opt/openclaw/data/quarterly-report.pdf
+sudo systemctl start openclaw-agent
+while systemctl is-active --quiet openclaw-agent; do sleep 5; done
+cat /opt/openclaw/data/analysis.md
+sudo systemctl stop openclaw-agent  # no-op if already exited, but safe to call
+```
+
+#### Scenario 2: Supervised Code Generation
+
+The agent generates code. The operator reviews it before it is ever executed.
+
+```bash
+# Stage the specification
+echo "Write a Python script to parse CSV files in /app/data/input/" \
+  | sudo tee /opt/openclaw/data/task.txt > /dev/null
+sudo chown openclaw:openclaw /opt/openclaw/data/task.txt
+
+sudo systemctl start openclaw-agent
+while systemctl is-active --quiet openclaw-agent; do sleep 5; done
+
+# Review the generated code before running it anywhere
+cat /opt/openclaw/data/generated_script.py
+
+# If safe to run, execute it manually (not by the agent)
+python3 /opt/openclaw/data/generated_script.py
+```
+
+#### Scenario 3: Nightly Batch Processing
+
+Set up a systemd timer to run the agent nightly on new input files.
+
+```bash
+cat << 'EOF' | sudo tee /etc/systemd/system/openclaw-nightly.timer
+[Unit]
+Description=Nightly OpenClaw batch run
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=600
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# The timer starts the agent service directly
+# This works because openclaw-agent is already defined as a systemd service
+sudo systemctl daemon-reload
+sudo systemctl enable --now openclaw-nightly.timer
+
+# Verify the timer is scheduled
+systemctl list-timers openclaw-nightly.timer
+```
+
+#### Scenario 4: Interactive Debugging Session
+
+When a task is failing and you need to inspect the container environment interactively.
+
+```bash
+# Start the container with a shell instead of the default entrypoint
+# This overrides the normal agent startup
+sudo runuser -u openclaw -- \
+  env XDG_RUNTIME_DIR=/run/user/$(id -u openclaw) \
+  podman run \
+    --rm \
+    --interactive \
+    --tty \
+    --name openclaw_debug \
+    --network=none \
+    --user $(id -u openclaw):$(id -g openclaw) \
+    --userns=keep-id \
+    --read-only \
+    --cap-drop=all \
+    --security-opt no-new-privileges=true \
+    --tmpfs /tmp:noexec,nosuid,nodev,size=128m \
+    --tmpfs /run:noexec,nosuid,nodev,size=64m \
+    --volume /opt/openclaw/data:/app/data:rw,Z \
+    --volume /opt/openclaw/skills:/app/skills:ro,Z \
+    --volume /opt/openclaw/config:/app/config:ro,Z \
+    --entrypoint /bin/sh \
+    ghcr.io/openclaw/openclaw:latest
+
+# Inside the container you can inspect:
+# ls /app/data /app/skills /app/config
+# cat /app/config/config.yaml
+# id
+# ip addr   (should show no interfaces)
+# exit to leave
+```
+
+#### Scenario 5: Emergency Stop During a Suspected Compromise
+
+```bash
+# Immediate hard kill — SIGKILL bypasses graceful shutdown
+sudo systemctl kill --signal=SIGKILL openclaw-agent
+
+# Confirm it is dead
+systemctl is-active openclaw-agent
+# Expected: inactive
+
+# Lock it from starting again until investigation is complete
+sudo systemctl mask openclaw-agent
+# This creates a symlink to /dev/null — even manual 'systemctl start' will fail
+
+# Investigate
+sudo journalctl -u openclaw-agent -b --no-pager > /tmp/incident-logs.txt
+sudo find /opt/openclaw/data -type f -newer /tmp/incident-start-marker -ls
+
+# When ready to restore normal operation
+sudo systemctl unmask openclaw-agent
+```
