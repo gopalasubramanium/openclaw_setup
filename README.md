@@ -1522,3 +1522,733 @@ sudo find /opt/openclaw/data -type f -newer /tmp/incident-start-marker -ls
 # When ready to restore normal operation
 sudo systemctl unmask openclaw-agent
 ```
+
+---
+
+## Appendix A — OpenClaw CLI Quick Reference
+
+> **Context:** All `openclaw` commands below run **on the host** or from a machine that can reach the Gateway over SSH or WebSocket. They are not run inside the container. The container runs the OpenClaw process; the CLI manages it from outside. On this ZimaBoard deployment, run CLI commands either directly on the board (via SSH) or remotely by pointing `--url` at the Gateway's WebSocket address.
+>
+> **Installation:** `npm install -g openclaw@latest` (requires Node 22.16+ or Node 24). This is separate from the container image. The CLI is the operator's control plane; the container image is the agent's runtime.
+
+---
+
+### A.1 — Initial Setup and Onboarding
+
+Onboarding is the one-time wizard that configures the Gateway, workspace, auth provider, and first channel. On this ZimaBoard deployment the Gateway runs as a systemd service inside the container; onboarding configures what it connects to and how it authenticates.
+
+```bash
+# Guided interactive onboarding — recommended for first-time setup
+openclaw onboard
+
+# Quick path — minimal prompts, auto-generates a gateway token
+openclaw onboard --flow quickstart
+
+# Full prompts — explicit port, bind address, and auth configuration
+openclaw onboard --flow manual
+
+# Connect to a remote Gateway that is already running (e.g. this ZimaBoard)
+# Replace the URL with your board's IP or hostname
+openclaw onboard --mode remote --remote-url ws://192.168.1.100:18789
+
+# Open the dashboard UI immediately after onboarding (no channel setup needed)
+openclaw dashboard
+```
+
+**What onboarding does:**
+- Creates `~/.openclaw/openclaw.json` — the main config file
+- Creates `~/.openclaw/workspace/` — the agent's workspace directory
+- Configures the Gateway mode (local or remote)
+- Sets up your first auth provider (Anthropic, OpenAI, Ollama, etc.)
+- Optionally walks through channel setup (Telegram, Slack, WhatsApp, etc.)
+
+---
+
+### A.2 — Gateway Management
+
+The Gateway is the WebSocket server that routes messages between channels, agents, and nodes. On this ZimaBoard deployment it runs as a systemd service (`openclaw-agent`) rather than as a user-level daemon.
+
+```bash
+# Check Gateway service and connection status
+openclaw gateway status
+
+# Check Gateway status and probe the live WebSocket connection
+openclaw gateway status --probe
+
+# Detailed health probe — checks localhost even if remote is configured
+openclaw gateway probe
+
+# Probe a remote Gateway over SSH (board's IP)
+openclaw gateway probe --ssh user@192.168.1.100
+
+# Start / stop / restart the Gateway user service
+# (On this ZimaBoard, use systemctl instead — see Managing the Agent)
+openclaw gateway start
+openclaw gateway stop
+openclaw gateway restart
+
+# Install the Gateway as a persistent user service (launchd on macOS, systemd on Linux)
+openclaw gateway install
+
+# View live Gateway logs
+openclaw logs --tail
+
+# Low-level: call a Gateway RPC method directly
+openclaw gateway call status
+openclaw gateway call logs.tail --params '{"sinceMs": 60000}'
+
+# Discover gateways on the local network via mDNS
+openclaw gateway discover
+openclaw gateway discover --timeout 4000
+```
+
+---
+
+### A.3 — Models and Auth Providers
+
+OpenClaw supports multiple LLM providers simultaneously. The model commands manage which provider and model the agent uses, and handle authentication tokens.
+
+```bash
+# Show current default model, fallbacks, and auth status
+openclaw models status
+
+# Show model status with live auth probes (makes real requests, may consume tokens)
+openclaw models status --probe
+
+# List all available models from configured providers
+openclaw models list
+
+# Scan for available models from all configured providers
+openclaw models scan
+
+# Set the default model
+openclaw models set claude-sonnet-4-5                          # Anthropic (default provider)
+openclaw models set anthropic/claude-opus-4-5                  # Explicit provider prefix
+openclaw models set openai/gpt-4o                              # OpenAI
+openclaw models set openrouter/moonshotai/kimi-k2              # OpenRouter (include provider prefix)
+openclaw models set ollama/llama3.2                            # Local Ollama model
+
+# Add a new auth provider interactively
+openclaw models auth add
+
+# Log in to a specific provider (OAuth or API key flow)
+openclaw models auth login --provider anthropic
+openclaw models auth login --provider openai
+openclaw models auth login --provider ollama
+
+# Add an API key via setup token (generate with 'claude setup-token' on another machine)
+openclaw models auth setup-token
+
+# Paste a token string directly (for automation)
+openclaw models auth paste-token
+
+# List configured model aliases
+openclaw models aliases list
+
+# Add a shorthand alias for a model
+openclaw models aliases add fast openai/gpt-4o-mini
+openclaw models aliases add smart anthropic/claude-opus-4-5
+
+# List and manage fallback models (used when primary is unavailable)
+openclaw models fallbacks list
+openclaw models fallbacks add openai/gpt-4o-mini
+openclaw models fallbacks clear
+```
+
+---
+
+### A.4 — Agents
+
+An agent is an isolated workspace with its own identity, auth credentials, and channel routing. The default agent is called `main`. Additional agents allow you to run separate personas or task-scoped assistants on the same Gateway.
+
+```bash
+# List all configured agents
+openclaw agents list
+
+# List agents with their channel bindings
+openclaw agents list --bindings
+
+# Add a new agent with its own workspace
+openclaw agents add work --workspace ~/.openclaw/workspace-work
+
+# Add a non-interactively (requires --workspace)
+openclaw agents add ops \
+  --workspace ~/.openclaw/workspace-ops \
+  --non-interactive
+
+# Show channel bindings for a specific agent
+openclaw agents bindings
+openclaw agents bindings --agent work
+
+# Bind an agent to receive messages from a specific channel account
+openclaw agents bind --agent work --bind telegram:my-bot-account
+openclaw agents bind --agent ops  --bind slack:workspace-name
+
+# Bind multiple channels at once
+openclaw agents bind --agent ops \
+  --bind telegram:ops-bot \
+  --bind discord:guild-a
+
+# Remove a channel binding
+openclaw agents unbind --agent work --bind telegram:my-bot-account
+
+# Set agent identity from an IDENTITY.md file in the workspace root
+openclaw agents set-identity --workspace ~/.openclaw/workspace --from-identity
+
+# Set agent identity fields explicitly
+openclaw agents set-identity --agent main \
+  --name "ZimaBot" \
+  --emoji "🦞" \
+  --avatar avatars/openclaw.png
+
+# Delete an agent and its workspace (moves to Trash, not hard-deleted)
+# Interactive confirmation required unless --force is passed
+openclaw agents delete work
+openclaw agents delete work --force
+```
+
+---
+
+### A.5 — Channels
+
+Channels are the messaging platforms OpenClaw connects to — Telegram, Slack, WhatsApp, Discord, Signal, iMessage, and many others. Each channel account is configured separately.
+
+```bash
+# List all configured channel accounts and their status
+openclaw channels list
+
+# Show runtime status of all channels on the Gateway
+openclaw channels status
+
+# Add a Telegram bot
+openclaw channels add --channel telegram --token YOUR_BOT_TOKEN
+
+# Add a Slack workspace
+openclaw channels add --channel slack
+
+# Add a Discord bot
+openclaw channels add --channel discord --token YOUR_BOT_TOKEN
+
+# Add WhatsApp (interactive QR code login)
+openclaw channels login --channel whatsapp
+
+# Remove a channel account
+openclaw channels remove --channel telegram --delete
+
+# Log out of a channel (keeps config, disconnects session)
+openclaw channels logout --channel whatsapp
+
+# View live logs for a specific channel
+openclaw channels logs --channel telegram
+
+# View logs for all channels
+openclaw channels logs --channel all
+
+# Check what capabilities a channel supports (intents, scopes, features)
+openclaw channels capabilities
+openclaw channels capabilities --channel discord --target channel:123456789
+
+# Resolve human-readable names to channel IDs
+openclaw channels resolve --channel slack "#general" "@jane"
+openclaw channels resolve --channel discord "My Server/#support" "@someone"
+```
+
+**Channel-specific notes for this ZimaBoard deployment:** Because the container runs with `--network=none`, channel connections are made by the Gateway running on the host (or in a network-enabled configuration), not by the container process itself. If you need live channel connectivity, the Gateway must have network access. See [Temporarily Enabling Outbound Network Access](#temporarily-enabling-outbound-network-access).
+
+---
+
+### A.6 — Device Pairing
+
+Pairing connects external apps or devices — iOS app, Android app, browser companion, other CLI instances — to your Gateway as nodes.
+
+```bash
+# List pending pairing requests
+openclaw pairing list whatsapp
+openclaw pairing list telegram
+
+# Approve a pairing request
+# <code> is the pairing code shown in the app or device requesting pairing
+openclaw pairing approve whatsapp ABC123
+
+# Approve and send a notification to the paired device when done
+openclaw pairing approve telegram ABC123 --notify
+
+# List all paired nodes (devices)
+openclaw nodes list
+
+# List only currently-connected nodes
+openclaw nodes list --connected
+
+# List nodes that connected within the last 24 hours
+openclaw nodes list --last-connected 24h
+
+# Show pending node pairing requests
+openclaw nodes pending
+
+# Approve a node pairing request by requestId
+openclaw nodes approve <requestId>
+
+# Show node connection status
+openclaw nodes status
+openclaw nodes status --connected
+```
+
+---
+
+### A.7 — Skills
+
+Skills extend what the agent can do — they define tools, workflows, and capabilities the agent can invoke. Skills live in the workspace and can be installed from ClawHub (the community skill registry) or written locally.
+
+```bash
+# List all skills (bundled + workspace + managed)
+openclaw skills list
+
+# List only eligible skills (requirements met on this system)
+openclaw skills list --eligible
+
+# Show detailed info about a specific skill
+openclaw skills info <skill-name>
+openclaw skills info file-manager
+openclaw skills info web-search
+
+# Check skill requirements and flag any that are missing dependencies
+openclaw skills check
+
+# Install a skill from ClawHub
+# Skills installed this way are placed in the workspace skills directory
+openclaw plugins install clawhub:<skill-name>
+
+# Update a specific plugin/skill
+openclaw plugins update <skill-id>
+
+# Update all installed plugins
+openclaw plugins update --all
+```
+
+**In this deployment:** Because skills are mounted read-only into the container (`/app/skills:ro`), the agent cannot self-install skills at runtime. To install a new skill:
+
+```bash
+# 1. Install the skill on the host as root
+sudo openclaw skills install clawhub:web-search   # if CLI is installed on the host
+# OR copy skill files manually:
+sudo cp -r ~/my-skill/ /opt/openclaw/skills/my-skill/
+sudo chmod -R 644 /opt/openclaw/skills/my-skill/
+
+# 2. Restart the agent to pick up the new skill
+sudo systemctl restart openclaw-agent
+```
+
+---
+
+### A.8 — Plugins
+
+Plugins extend the Gateway itself — they add new providers, channels, memory engines, and tool integrations. Unlike skills (which extend the agent), plugins run in-process with the Gateway.
+
+```bash
+# List all plugins (bundled + installed)
+openclaw plugins list
+
+# Show detailed info about a plugin
+openclaw plugins info <plugin-id>
+
+# Enable a bundled plugin (bundled plugins ship disabled)
+openclaw plugins enable memory-core
+openclaw plugins enable voice-elevenlabs
+openclaw plugins enable browser-puppeteer
+
+# Disable a plugin
+openclaw plugins disable voice-elevenlabs
+
+# Install a plugin from a path or npm spec
+openclaw plugins install ./my-local-plugin
+openclaw plugins install clawhub:my-plugin
+openclaw plugins install my-plugin@1.2.3
+
+# Install and link a local plugin without copying (for development)
+openclaw plugins install --link ./my-plugin
+
+# Check for plugin load errors
+openclaw plugins doctor
+
+# Update a specific plugin
+openclaw plugins update <plugin-id>
+
+# Update all plugins
+openclaw plugins update --all
+
+# Dry-run update (show what would change)
+openclaw plugins update <plugin-id> --dry-run
+```
+
+---
+
+### A.9 — Approvals
+
+Approvals control which shell commands and programs the agent is allowed to execute. This is the primary safety gate for exec-capable operation. The allowlist defines pre-approved commands that do not require interactive confirmation; everything else is denied or prompted.
+
+```bash
+# View the current approvals config (local disk)
+openclaw approvals get
+
+# View approvals for a specific node
+openclaw approvals get --node zimaboard
+
+# View approvals on the Gateway
+openclaw approvals get --gateway
+
+# Replace the full approvals config from a file
+openclaw approvals set --file ./exec-approvals.json
+openclaw approvals set --gateway --file ./exec-approvals.json
+openclaw approvals set --node zimaboard --file ./exec-approvals.json
+
+# Add a specific command to the allowlist
+openclaw approvals allowlist add "/usr/bin/git"
+openclaw approvals allowlist add "/usr/bin/python3"
+openclaw approvals allowlist add "~/Projects/**/bin/rg"
+
+# Add a command to the allowlist for all agents on a specific node
+openclaw approvals allowlist add \
+  --agent "*" \
+  --node zimaboard \
+  "/usr/bin/uptime"
+
+# Add a command scoped to a single agent
+openclaw approvals allowlist add \
+  --agent main \
+  "/usr/local/bin/my-tool"
+
+# Remove a command from the allowlist
+openclaw approvals allowlist remove "/usr/bin/git"
+```
+
+**Example `exec-approvals.json` structure for a document-processing workflow:**
+
+```json
+{
+  "allowlist": [
+    "/usr/bin/python3",
+    "/usr/bin/grep",
+    "/usr/bin/find",
+    "/usr/bin/wc",
+    "/usr/bin/sort",
+    "/usr/bin/head",
+    "/usr/bin/tail",
+    "/usr/bin/cat",
+    "/usr/bin/sed",
+    "/usr/bin/awk"
+  ],
+  "security": "allowlist"
+}
+```
+
+**Security modes:**
+
+| Mode | Behaviour |
+|------|-----------|
+| `deny` | All exec blocked regardless of allowlist |
+| `allowlist` | Only allowlisted commands execute; all others denied |
+| `full` | All commands allowed (never use this in production) |
+
+---
+
+### A.10 — Memory
+
+OpenClaw's memory system indexes conversation history, workspace files, and notes into a searchable vector store. The agent uses this to recall past context.
+
+```bash
+# Show memory status
+openclaw memory status
+
+# Deep probe — checks vector store and embedding model availability
+openclaw memory status --deep
+
+# Deep probe with index recheck
+openclaw memory status --deep --index
+
+# Trigger a manual re-index
+openclaw memory index
+
+# Re-index with verbose output (shows per-phase detail)
+openclaw memory index --verbose
+
+# Search memory for a specific topic
+openclaw memory search "release checklist"
+openclaw memory search "project deadlines Q3"
+openclaw memory search "API key configuration"
+
+# Scope memory operations to a specific agent
+openclaw memory status --agent main
+openclaw memory index --agent ops --verbose
+```
+
+---
+
+### A.11 — Scheduled Tasks (Cron)
+
+The Gateway includes a cron scheduler for running recurring agent tasks without operator intervention.
+
+```bash
+# List all scheduled cron jobs
+openclaw cron list
+
+# Check cron job status and next run times
+openclaw cron status
+
+# Add a recurring job (standard cron syntax)
+# The message is sent to the agent as a task
+openclaw cron add "0 8 * * 1-5" "Summarise overnight email and send digest"
+openclaw cron add "0 9 * * 1" "Generate weekly status report"
+openclaw cron add "*/30 * * * *" "Check for new tasks in inbox"
+
+# Add a one-shot job at a specific time (auto-deletes after success)
+openclaw cron add --at "2026-05-01T09:00:00" "Remind: quarterly review today"
+
+# Add a job and deliver output to a specific channel
+openclaw cron add "0 7 * * *" "Morning briefing" \
+  --announce \
+  --channel telegram \
+  --to "123456789"
+
+# Edit an existing job — change delivery target without changing the message
+openclaw cron edit <job-id> --announce --channel slack --to "channel:C1234567890"
+
+# Disable delivery for a job (keeps it running, suppresses output)
+openclaw cron edit <job-id> --no-deliver
+
+# Enable a disabled job
+openclaw cron enable <job-id>
+
+# Disable a job without deleting it
+openclaw cron disable <job-id>
+
+# Remove a job
+openclaw cron rm <job-id>
+
+# View recent cron run history
+openclaw cron runs
+```
+
+---
+
+### A.12 — Sessions
+
+Sessions are conversation threads. Each channel message starts or continues a session. Managing sessions lets you review history, resume conversations, or clean up stale threads.
+
+```bash
+# List all stored sessions
+openclaw sessions
+
+# List sessions active within the last 2 hours
+openclaw sessions --active 120
+
+# Output in JSON for scripting
+openclaw sessions --json
+
+# Send a message to an existing session (continue a conversation)
+openclaw agent --session-id <id> --message "Continue where we left off"
+
+# Start a new session with a specific agent
+openclaw agent --agent ops --message "Start a new task"
+
+# Send a message and deliver the reply to a channel
+openclaw agent --agent ops \
+  --message "Generate weekly report" \
+  --deliver \
+  --reply-channel slack \
+  --reply-to "#reports"
+
+# Send a message with extended thinking enabled
+openclaw agent --agent main \
+  --message "Analyse this problem thoroughly" \
+  --thinking medium
+
+# Force local execution (skip Gateway, run embedded)
+openclaw agent --agent main --message "Run this locally" --local
+```
+
+---
+
+### A.13 — Diagnostics and Health
+
+```bash
+# Run all health checks
+openclaw doctor
+
+# Run health checks and attempt automatic repairs
+openclaw doctor --repair
+
+# Deep health check including channel probes
+openclaw doctor --deep
+
+# Show overall system status
+openclaw status
+
+# Deep status probe across all subsystems
+openclaw status --deep
+
+# View live gateway logs
+openclaw logs --tail
+
+# View logs for the last N minutes
+openclaw logs --since 30m
+
+# View logs in JSON format (for log aggregation)
+openclaw logs --json
+
+# Check for available OpenClaw updates
+openclaw update --check
+
+# Update OpenClaw to the latest version
+openclaw update
+```
+
+---
+
+### A.14 — Config Management
+
+```bash
+# View the full config
+openclaw config get
+
+# Get a specific config key
+openclaw config get gateway.port
+openclaw config get agents.list
+
+# Set a config value
+openclaw config set gateway.port 18789
+openclaw config set gateway.bind lan
+
+# Unset a config key (revert to default)
+openclaw config unset gateway.bind
+
+# Run the interactive configuration wizard
+openclaw configure
+```
+
+---
+
+## Appendix B — Daily Operations Cheatsheet
+
+A condensed reference for the most common daily operations on this ZimaBoard deployment.
+
+### Morning Check
+
+```bash
+# Is the agent running?
+sudo systemctl status openclaw-agent
+
+# Any errors in the last 12 hours?
+sudo journalctl -u openclaw-agent --since "12 hours ago" | grep -i 'error\|fatal\|warn'
+
+# Disk usage OK?
+df -h /
+du -sh /opt/openclaw/data /opt/backups/restic
+
+# Is the backup current?
+sudo RESTIC_PASSWORD_FILE=/etc/openclaw/restic.key \
+     RESTIC_REPOSITORY=/opt/backups/restic \
+     restic snapshots | tail -3
+
+# Gateway reachable?
+openclaw gateway health --url ws://localhost:18789
+```
+
+### Starting a Task
+
+```bash
+# Place input
+sudo cp ~/my-input.txt /opt/openclaw/data/
+sudo chown openclaw:openclaw /opt/openclaw/data/my-input.txt
+
+# Start
+sudo systemctl start openclaw-agent
+
+# Watch
+sudo journalctl -u openclaw-agent -f
+```
+
+### After a Task
+
+```bash
+# Collect output
+ls /opt/openclaw/data/
+cp /opt/openclaw/data/output.md ~/results/
+
+# Stop the agent (Restart=no means it may already be stopped)
+sudo systemctl stop openclaw-agent
+
+# Clean data dir for next run
+sudo rm -f /opt/openclaw/data/input.txt /opt/openclaw/data/output.md
+```
+
+### Updating Skills or Config
+
+```bash
+# Stop agent
+sudo systemctl stop openclaw-agent
+
+# Update as root (skills and config are root-owned)
+sudo cp ~/new-skill.json /opt/openclaw/skills/
+sudo cp ~/updated-config.yaml /opt/openclaw/config/config.yaml
+
+# Commit to git for audit trail
+sudo git -C /opt/openclaw add skills/ config/
+sudo git -C /opt/openclaw commit -m "Update skills and config $(date +%Y%m%d)"
+
+# Start
+sudo systemctl start openclaw-agent
+```
+
+### Security Posture Check
+
+```bash
+grep -q 'network=none'   /etc/systemd/system/openclaw-agent.service && echo "OK: network=none"     || echo "WARN: check network"
+grep -q 'skills.*:ro'    /etc/systemd/system/openclaw-agent.service && echo "OK: skills read-only" || echo "WARN: skills writable"
+grep -q 'config.*:ro'    /etc/systemd/system/openclaw-agent.service && echo "OK: config read-only" || echo "WARN: config writable"
+grep -q 'cap-drop=all'   /etc/systemd/system/openclaw-agent.service && echo "OK: caps dropped"     || echo "WARN: check caps"
+[[ ! -d /etc/systemd/system/openclaw-agent.service.d ]] && echo "OK: no overrides" || echo "WARN: overrides active"
+sudo aa-status 2>/dev/null | grep -q 'openclaw-agent'                && echo "OK: AppArmor active"  || echo "WARN: check AppArmor"
+```
+
+---
+
+## Appendix C — Environment Variables
+
+Key environment variables that affect OpenClaw CLI and Gateway behaviour on this deployment.
+
+| Variable | Purpose | Example |
+|----------|---------|---------|
+| `OPENCLAW_GATEWAY_TOKEN` | Authenticate CLI commands to the Gateway | Set in `~/.openclaw/openclaw.json` |
+| `OPENCLAW_AGENT_DIR` | Override the agent workspace directory | `/var/lib/openclaw/workspace` |
+| `OPENCLAW_LOCAL_CHECK` | Enable host-aware checks in dev shells | `1` |
+| `OPENCLAW_LIVE_TEST` | Enable live API tests (consumes tokens) | `1` |
+| `XDG_RUNTIME_DIR` | Required for rootless Podman | `/run/user/999` |
+| `HOME` | Required for rootless Podman user context | `/var/lib/openclaw` |
+| `NO_COLOR` | Disable ANSI colour in CLI output | `1` |
+
+These variables are set by the systemd service unit for the container. For CLI invocations on the host, `XDG_RUNTIME_DIR` and `HOME` must be set when calling Podman as the `openclaw` user — this is handled by the `runuser` calls in the deploy script.
+
+---
+
+## Appendix D — File and Directory Reference
+
+| Path | Purpose | Owner | Writable by agent |
+|------|---------|-------|------------------|
+| `/opt/openclaw/` | Deployment root | root | No |
+| `/opt/openclaw/data/` | Agent runtime I/O | openclaw | Yes |
+| `/opt/openclaw/skills/` | Skill definitions | root | No (ro mount) |
+| `/opt/openclaw/config/` | Agent configuration | root | No (ro mount) |
+| `/var/lib/openclaw/` | Agent user home, Podman storage | openclaw | Yes |
+| `/var/lib/openclaw/.config/containers/` | Podman storage config | openclaw | Yes |
+| `/var/lib/openclaw/.local/share/containers/` | Container image layers | openclaw | Yes |
+| `/etc/openclaw/` | Deploy-time config (key, excludes) | root | No |
+| `/etc/openclaw/restic.key` | Backup encryption key | root | No |
+| `/etc/openclaw/restic-excludes.txt` | Restic exclude list | root | No |
+| `/etc/systemd/system/openclaw-agent.service` | Agent systemd unit | root | No |
+| `/etc/apparmor.d/openclaw-agent` | AppArmor profile | root | No |
+| `/opt/backups/restic/` | Restic backup repository | root | No |
+| `/var/log/openclaw-deploy.log` | Deploy script log | root | No |
+| `/run/user/999/` | Podman runtime dir (ephemeral) | openclaw | Yes |
+| `~/.openclaw/openclaw.json` | CLI/Gateway config (on operator machine) | user | n/a |
+| `~/.openclaw/workspace/` | Agent workspace (on operator machine) | user | n/a |
+| `~/.openclaw/exec-approvals.json` | Exec approvals (on operator machine) | user | n/a |
